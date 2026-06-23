@@ -28,19 +28,69 @@ jobs:
       - name: Package release files
         shell: bash
         run: |
+          . /opt/esp/idf/export.sh
           mkdir -p release
+          python -m esptool --chip esp32s3 merge_bin \
+            -o release/usb2ble_midi_bridge_merged.bin \
+            --flash_mode dio \
+            --flash_freq 80m \
+            --flash_size 8MB \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/usb2ble_midi_bridge.bin
           cp build/usb2ble_midi_bridge.bin release/
           cp build/bootloader/bootloader.bin release/
           cp build/partition_table/partition-table.bin release/
           cp build/flasher_args.json release/
           cp build/flash_args release/
+          cat > release/flash_merged.sh <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+
+          PORT="${1:-}"
+          if [ -z "$PORT" ]; then
+            echo "Usage: $0 PORT"
+            echo "Example: $0 /dev/cu.usbserial-120"
+            exit 2
+          fi
+
+          python -m esptool --chip esp32s3 -p "$PORT" -b 460800 \
+            --before default_reset --after hard_reset \
+            write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m \
+            0x0 usb2ble_midi_bridge_merged.bin
+          EOF
+          chmod +x release/flash_merged.sh
+          cat > release/web-flasher-manifest.json <<EOF
+          {
+            "name": "USB2BLE MIDI Bridge",
+            "version": "${GITHUB_REF_NAME:-manual}",
+            "new_install_prompt_erase": true,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  {
+                    "path": "usb2ble_midi_bridge_merged.bin",
+                    "offset": 0
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
           cat > release/README.txt <<'EOF'
           USB2BLE MIDI Bridge firmware
 
-          Flash with ESP-IDF:
-            idf.py -p PORT flash
+          Easiest command:
+            python -m esptool --chip esp32s3 -p PORT -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m 0x0 usb2ble_midi_bridge_merged.bin
 
-          Manual esptool command:
+          macOS/Linux helper:
+            sh flash_merged.sh PORT
+
+          Example:
+            sh flash_merged.sh /dev/cu.usbserial-120
+
+          Advanced multi-file command:
             python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 usb2ble_midi_bridge.bin
           EOF
           cd release
@@ -48,9 +98,12 @@ jobs:
             bootloader.bin \
             flash_args \
             flasher_args.json \
+            flash_merged.sh \
             partition-table.bin \
             README.txt \
+            usb2ble_midi_bridge_merged.bin \
             usb2ble_midi_bridge.bin \
+            web-flasher-manifest.json \
             > SHA256SUMS.txt
 
       - name: Upload build artifact
