@@ -34,3 +34,49 @@ Connect the USB Type A breakout board to ESP32-S3 as follows:
 ```bash
 idf.py -p /dev/your_usb_to_serial_port flash
 ```
+
+## Flash Prebuilt Release Firmware
+
+Download firmware files from the latest GitHub Release.
+
+### Recommended: single merged binary
+
+Download:
+
+- `usb2ble_midi_bridge_merged.bin`
+
+Install `esptool` if needed:
+
+```bash
+python -m pip install esptool
+```
+
+Flash it at offset `0x0`:
+
+```bash
+python -m esptool --chip esp32s3 -p /dev/your_usb_to_serial_port -b 460800 \
+  --before default_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m \
+  0x0 usb2ble_midi_bridge_merged.bin
+```
+
+On macOS the serial port is usually like `/dev/cu.usbserial-120` or `/dev/cu.usbmodem*`.
+
+### Advanced: separate binaries
+
+Download:
+
+- `bootloader.bin`
+- `partition-table.bin`
+- `usb2ble_midi_bridge.bin`
+
+Flash them with explicit offsets:
+
+```bash
+python -m esptool --chip esp32s3 -p /dev/your_usb_to_serial_port -b 460800 \
+  --before default_reset --after hard_reset \
+  write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m \
+  0x0 bootloader.bin \
+  0x8000 partition-table.bin \
+  0x10000 usb2ble_midi_bridge.bin
+```
