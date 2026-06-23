@@ -3,6 +3,7 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include <stddef.h>
 
 #define MIDI_NUM_HANDLE 4
 
@@ -19,4 +20,4 @@ esp_err_t ble_midi_send_data(uint8_t* data, uint16_t length);
 // Set MIDI message receive callback function
 void ble_midi_set_callback(midi_callback_t callback);
 
-#endif 
+#endif

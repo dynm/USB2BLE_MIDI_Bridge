@@ -58,27 +58,77 @@ static void pack_timestamp(uint16_t timestamp, uint8_t* ble_data) {
     ble_data[1] = 0x80 | (timestamp & 0x7F);         // Low 7 bits
 }
 
-// Modified USB MIDI callback function
-static void usb_midi_data_callback(const uint8_t* data, size_t len) {
-    ESP_LOGI(TAG, "USB MIDI packet parsing:");
-    ESP_LOGI(TAG, "Cable Number: 0x%01x", (data[0] >> 4) & 0x0F);
-    ESP_LOGI(TAG, "Code Index: 0x%01x", data[0] & 0x0F);
-    ESP_LOGI(TAG, "MIDI Event: %02x %02x %02x", data[1], data[2], data[3]);
-    
+static uint8_t usb_midi_cin_payload_len(uint8_t cin) {
+    switch (cin) {
+    case 0x2:
+    case 0x6:
+    case 0xC:
+    case 0xD:
+        return 2;
+    case 0x3:
+    case 0x4:
+    case 0x7:
+    case 0x8:
+    case 0x9:
+    case 0xA:
+    case 0xB:
+    case 0xE:
+        return 3;
+    case 0x5:
+    case 0xF:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void forward_usb_midi_event(const uint8_t *event)
+{
+    uint8_t cin = event[0] & 0x0F;
+    uint8_t midi_len = usb_midi_cin_payload_len(cin);
+    if (midi_len == 0) {
+        ESP_LOGW(TAG, "Ignoring unsupported USB MIDI CIN: 0x%01x", cin);
+        return;
+    }
+
+    ESP_LOGD(TAG, "USB MIDI cable=0x%01x cin=0x%01x event=%02x %02x %02x",
+             (event[0] >> 4) & 0x0F,
+             cin,
+             event[1],
+             event[2],
+             event[3]);
+
     // Get current timestamp
     uint16_t current_ts = get_current_timestamp();
-    
+
     // Prepare BLE MIDI packet
     uint8_t ble_data[5];
     pack_timestamp(current_ts, ble_data);
-    memcpy(&ble_data[2], &data[1], 3);  // Copy MIDI event data
-    
+    memcpy(&ble_data[2], &event[1], midi_len);
+
     // Send data
-    esp_err_t send_success = ble_midi_send_data(ble_data, 5);
+    esp_err_t send_success = ble_midi_send_data(ble_data, midi_len + 2);
     if (send_success == ESP_OK) {
-        ESP_LOGI(TAG, "Forwarded to BLE MIDI (timestamp: 0x%04x)", current_ts);
-    } else {
+        ESP_LOGD(TAG, "Forwarded to BLE MIDI (timestamp: 0x%04x)", current_ts);
+    } else if (send_success != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Send failed");
+    }
+}
+
+// Modified USB MIDI callback function
+static void usb_midi_data_callback(const uint8_t* data, size_t len) {
+    if (data == NULL || len < 4) {
+        ESP_LOGW(TAG, "Ignoring short USB MIDI transfer: %u bytes", (unsigned)len);
+        return;
+    }
+
+    size_t packet_count = len / 4;
+    for (size_t i = 0; i < packet_count; i++) {
+        forward_usb_midi_event(&data[i * 4]);
+    }
+
+    if ((len % 4) != 0) {
+        ESP_LOGW(TAG, "USB MIDI transfer had %u trailing byte(s)", (unsigned)(len % 4));
     }
 }
 
@@ -105,6 +155,6 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(usb_midi_init(&usb_config));
     ESP_LOGI(TAG, "USB MIDI Initialization Completed");
-    
+
     ESP_LOGI(TAG, "Waiting for device connection...");
-} 
+}

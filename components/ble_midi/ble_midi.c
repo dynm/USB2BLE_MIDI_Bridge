@@ -20,6 +20,7 @@ static const char *TAG = "BLE_MIDI";
 
 #define BLEMIDI_NUM_PORTS 1
 #define GATTS_MIDI_CHAR_VAL_LEN_MAX 100
+#define ADV_RESTART_DELAY_US 2000000
 
 // GATT service table index
 enum {
@@ -84,6 +85,11 @@ static struct gatts_profile_inst midi_profile_tab[MIDI_PROFILE_NUM] = {
 static uint8_t blemidi_outbuffer[BLEMIDI_NUM_PORTS][GATTS_MIDI_CHAR_VAL_LEN_MAX];
 static uint32_t blemidi_outbuffer_len[BLEMIDI_NUM_PORTS];
 static size_t blemidi_mtu = GATTS_MIDI_CHAR_VAL_LEN_MAX - 3;
+static bool is_connected = false;
+static bool notifications_enabled = false;
+static bool advertising = false;
+static bool adv_data_configured = false;
+static esp_timer_handle_t adv_restart_timer = NULL;
 
 // Get millisecond timestamp
 static uint32_t get_ms() {
@@ -155,7 +161,7 @@ static int32_t blemidi_outbuffer_push(uint8_t blemidi_port, uint8_t *stream, siz
 static esp_ble_adv_data_t adv_data = {
     .set_scan_rsp = false,
     .include_name = false,
-    .include_txpower = true,
+    .include_txpower = false,
     .min_interval = 0x0006,
     .max_interval = 0x0012,
     .appearance = BLE_APPEARANCE_MIDI,   // Set to MIDI device
@@ -172,39 +178,60 @@ static esp_ble_adv_data_t adv_data = {
 static esp_ble_adv_data_t scan_rsp_data = {
     .set_scan_rsp = true,
     .include_name = true,
-    .include_txpower = true,
+    .include_txpower = false,
     .min_interval = 0x0006,
     .max_interval = 0x0012,
-    .appearance = BLE_APPEARANCE_MIDI,   // Scan response also set to MIDI device
+    .appearance = 0,
     .manufacturer_len = 0,
     .p_manufacturer_data = NULL,
     .service_data_len = 0,
     .p_service_data = NULL,
-    .service_uuid_len = sizeof(midi_service_uuid),
-    .p_service_uuid = (uint8_t *)midi_service_uuid,
-    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+    .service_uuid_len = 0,
+    .p_service_uuid = NULL,
+    .flag = 0,
 };
 
 // Broadcast parameters
 static esp_ble_adv_params_t adv_params = {
-    .adv_int_min = 0x20,
-    .adv_int_max = 0x40,
+    .adv_int_min = 0x80,
+    .adv_int_max = 0x100,
     .adv_type = ADV_TYPE_IND,
     .own_addr_type = BLE_ADDR_TYPE_PUBLIC,
     .channel_map = ADV_CHNL_ALL,
     .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
+static void start_advertising_if_idle(void)
+{
+    if (!adv_data_configured || is_connected || advertising) {
+        return;
+    }
+
+    esp_err_t ret = esp_ble_gap_start_advertising(&adv_params);
+    if (ret == ESP_OK) {
+        advertising = true;
+    } else if (ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "Failed to start advertising: %s", esp_err_to_name(ret));
+    }
+}
+
+static void adv_restart_timer_cb(void *arg)
+{
+    (void)arg;
+    start_advertising_if_idle();
+}
+
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
-    ESP_LOGI(TAG, "GAP event: %d", event);
+    ESP_LOGD(TAG, "GAP event: %d", event);
     
     switch (event) {
     case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
         ESP_LOGI(TAG, "ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT");
         adv_config_done &= (~adv_config_flag);
         if (adv_config_done == 0){
-            esp_ble_gap_start_advertising(&adv_params);
+            adv_data_configured = true;
+            start_advertising_if_idle();
         }
         break;
         
@@ -212,7 +239,8 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         ESP_LOGI(TAG, "ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT");
         adv_config_done &= (~scan_rsp_config_flag);
         if (adv_config_done == 0){
-            esp_ble_gap_start_advertising(&adv_params);
+            adv_data_configured = true;
+            start_advertising_if_idle();
         }
         break;
         
@@ -221,12 +249,14 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
                  param->adv_start_cmpl.status);
         if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
             ESP_LOGE(TAG, "Broadcast start failed");
+            advertising = false;
         }
         break;
 
     case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
         ESP_LOGI(TAG, "ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT, status: %d", 
                  param->adv_stop_cmpl.status);
+        advertising = false;
         break;
 
     case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:  // Event 21
@@ -254,13 +284,10 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
         break;
 
     default:
-        ESP_LOGI(TAG, "Unhandled GAP event: %d", event);
+        ESP_LOGD(TAG, "Unhandled GAP event: %d", event);
         break;
     }
 }
-
-// Add necessary UUID definitions
-static uint16_t midi_handle_table[MIDI_IDX_NB];
 
 static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
@@ -317,7 +344,7 @@ static const esp_gatts_attr_db_t gatt_db[MIDI_IDX_NB] = {
 static midi_callback_t midi_callback = NULL;
 
 static void parse_sysex(const uint8_t* data, uint16_t len) {
-    if (len < 5) return;  // Message too short
+    if (len < 8) return;  // Message too short for the fields below
     
     // Skip timestamp bytes
     const uint8_t* sysex = data + 2;
@@ -333,8 +360,6 @@ static void parse_sysex(const uint8_t* data, uint16_t len) {
     }
 }
 
-static bool notifications_enabled = false;
-
 #define LED_GPIO    48
 #define LED_NUM     1
 
@@ -342,6 +367,9 @@ static led_strip_handle_t led_strip;
 
 // LED control function
 static void set_led_color(uint8_t r, uint8_t g, uint8_t b) {
+    if (led_strip == NULL) {
+        return;
+    }
     led_strip_set_pixel(led_strip, 0, r, g, b);
     led_strip_refresh(led_strip);
 }
@@ -370,7 +398,7 @@ static void init_led(void) {
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
 {
-    ESP_LOGI(TAG, "GATTS event: %d, gatts_if: %d", event, gatts_if);
+    ESP_LOGD(TAG, "GATTS event: %d, gatts_if: %d", event, gatts_if);
 
     switch (event) {
     case ESP_GATTS_REG_EVT:
@@ -411,29 +439,45 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         }
         break;
 
-    case ESP_GATTS_CONNECT_EVT:
+    case ESP_GATTS_CONNECT_EVT: {
         ESP_LOGI(TAG, "ESP_GATTS_CONNECT_EVT");
         midi_profile_tab[MIDI_PROFILE_APP_IDX].conn_id = param->connect.conn_id;
         midi_profile_tab[MIDI_PROFILE_APP_IDX].gatts_if = gatts_if;
+        is_connected = true;
+        advertising = false;
+        if (adv_restart_timer != NULL) {
+            esp_timer_stop(adv_restart_timer);
+        }
+        esp_ble_gap_stop_advertising();
+
+        esp_ble_conn_update_params_t conn_params = {0};
+        memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        conn_params.latency = 0;
+        conn_params.max_int = 0x20;  // 40 ms
+        conn_params.min_int = 0x10;  // 20 ms
+        conn_params.timeout = 400;   // 4 s
+        esp_ble_gap_update_conn_params(&conn_params);
+
         // Set LED color when connected
         set_led_color(0, 16, 0);  // RGB value, green intensity set to 64
         break;
+    }
 
     case ESP_GATTS_READ_EVT:
-        ESP_LOGI(TAG, "ESP_GATTS_READ_EVT, handle: %d", param->read.handle);
+        ESP_LOGD(TAG, "ESP_GATTS_READ_EVT, handle: %d", param->read.handle);
         if (param->read.handle == midi_handle_table[IDX_CHAR_VAL_A]) {
-            ESP_LOGI(TAG, "Reading MIDI characteristic value");
+            ESP_LOGD(TAG, "Reading MIDI characteristic value");
         }
         break;
 
     case ESP_GATTS_WRITE_EVT:
-        ESP_LOGI(TAG, "ESP_GATTS_WRITE_EVT, handle: %d, write_len: %d, is_prep: %d",
+        ESP_LOGD(TAG, "ESP_GATTS_WRITE_EVT, handle: %d, write_len: %d, is_prep: %d",
                  param->write.handle, param->write.len, param->write.is_prep);
         
         if (!param->write.is_prep) {
             if (param->write.handle == midi_handle_table[IDX_CHAR_VAL_A]) {
-                ESP_LOGI(TAG, "Received MIDI data write request");
-                ESP_LOG_BUFFER_HEX(TAG, param->write.value, param->write.len);
+                ESP_LOGD(TAG, "Received MIDI data write request");
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, param->write.value, param->write.len, ESP_LOG_DEBUG);
                 
                 // Check if it's a SysEx message
                 if (param->write.len > 3 && 
@@ -475,9 +519,17 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
 
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(TAG, "ESP_GATTS_DISCONNECT_EVT, reason: 0x%x", param->disconnect.reason);
+        is_connected = false;
+        notifications_enabled = false;
+        blemidi_outbuffer_len[0] = 0;
         // Turn off LED when disconnected
         set_led_color(16, 0, 0);
-        esp_ble_gap_start_advertising(&adv_params);
+        if (adv_restart_timer != NULL) {
+            esp_timer_stop(adv_restart_timer);
+            esp_timer_start_once(adv_restart_timer, ADV_RESTART_DELAY_US);
+        } else {
+            start_advertising_if_idle();
+        }
         break;
 
     case ESP_GATTS_DELETE_EVT:
@@ -485,26 +537,31 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         break;
 
     default:
-        ESP_LOGI(TAG, "Unhandled GATTS event: %d", event);
+        ESP_LOGD(TAG, "Unhandled GATTS event: %d", event);
         break;
     }
 } 
 
 // Modify send function
 esp_err_t ble_midi_send_message(uint8_t *data, size_t len) {
-    if (!midi_profile_tab[MIDI_PROFILE_APP_IDX].conn_id) {
+    if (!is_connected || !notifications_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (data == NULL || len == 0 || len > blemidi_mtu - 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (midi_profile_tab[MIDI_PROFILE_APP_IDX].gatts_if == ESP_GATT_IF_NONE ||
+        midi_handle_table[IDX_CHAR_VAL_A] == 0) {
         return ESP_ERR_INVALID_STATE;
     }
 
     // Add message to buffer
     blemidi_outbuffer_push(0, data, len);
 
-    // If message is large or buffer is almost full, flush immediately
-    if (len >= (blemidi_mtu - 3) || blemidi_outbuffer_len[0] >= (blemidi_mtu - 3)) {
-        blemidi_outbuffer_flush(0);
-    }
-
-    return ESP_OK;
+    // Flush immediately to keep MIDI latency low.
+    return blemidi_outbuffer_flush(0) == 0 ? ESP_OK : ESP_FAIL;
 } 
 
 // Add callback function setting interface
@@ -570,21 +627,33 @@ esp_err_t ble_midi_init(void)
         return ret;
     }
 
+    esp_timer_create_args_t adv_timer_args = {
+        .callback = adv_restart_timer_cb,
+        .name = "ble_adv_restart",
+    };
+    ret = esp_timer_create(&adv_timer_args, &adv_restart_timer);
+    if (ret) {
+        ESP_LOGE(TAG, "Failed to create advertising restart timer: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
     // Configure broadcast data
+    adv_config_done |= adv_config_flag;
     ret = esp_ble_gap_config_adv_data(&adv_data);
     if (ret) {
+        adv_config_done &= (~adv_config_flag);
         ESP_LOGE(TAG, "Failed to configure broadcast data: %s", esp_err_to_name(ret));
         return ret;
     }
-    adv_config_done |= adv_config_flag;
 
     // Configure scan response data
+    adv_config_done |= scan_rsp_config_flag;
     ret = esp_ble_gap_config_adv_data(&scan_rsp_data);
     if (ret) {
+        adv_config_done &= (~scan_rsp_config_flag);
         ESP_LOGE(TAG, "Failed to configure scan response data: %s", esp_err_to_name(ret));
         return ret;
     }
-    adv_config_done |= scan_rsp_config_flag;
 
     // Register application
     ret = esp_ble_gatts_app_register(MIDI_APP_ID);
@@ -601,9 +670,23 @@ esp_err_t ble_midi_init(void)
 }
 
 esp_err_t ble_midi_send_data(uint8_t* data, uint16_t length) {
+    if (!is_connected) {
+        ESP_LOGD(TAG, "No BLE client connected, cannot send MIDI data");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     if (!notifications_enabled) {
-        ESP_LOGW(TAG, "Notifications not enabled, cannot send MIDI data");
-        return ESP_FAIL;
+        ESP_LOGD(TAG, "Notifications not enabled, cannot send MIDI data");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (data == NULL || length == 0 || length > blemidi_mtu) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (midi_profile_tab[MIDI_PROFILE_APP_IDX].gatts_if == ESP_GATT_IF_NONE ||
+        midi_handle_table[IDX_CHAR_VAL_A] == 0) {
+        return ESP_ERR_INVALID_STATE;
     }
     
     esp_err_t ret = esp_ble_gatts_send_indicate(

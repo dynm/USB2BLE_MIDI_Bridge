@@ -13,7 +13,21 @@ static TaskHandle_t usb_midi_task_handle = NULL;
 static bool usb_midi_running = false;
 
 #define HOST_TASK_PRIORITY    2
-#define CLASS_TASK_PRIORITY   3
+#define USB_DESC_TYPE_INTERFACE 0x04
+#define USB_DESC_TYPE_ENDPOINT  0x05
+#define USB_CLASS_AUDIO         0x01
+#define USB_SUBCLASS_MIDISTREAMING 0x03
+#define USB_ENDPOINT_DIR_IN     0x80
+#define USB_ENDPOINT_XFER_MASK  0x03
+#define USB_ENDPOINT_XFER_BULK  0x02
+#define USB_ENDPOINT_XFER_INTR  0x03
+
+typedef struct {
+    uint8_t interface_num;
+    uint8_t interface_alt;
+    uint8_t endpoint_addr;
+    uint16_t max_packet_size;
+} usb_midi_endpoint_t;
 
 // USB MIDI device information
 typedef struct {
@@ -21,6 +35,9 @@ typedef struct {
     uint8_t dev_addr;
     usb_device_handle_t dev_hdl;
     bool device_connected;
+    bool interface_claimed;
+    uint8_t interface_num;
+    uint8_t interface_alt;
     SemaphoreHandle_t mutex;
 } usb_midi_dev_t;
 
@@ -29,6 +46,9 @@ static usb_midi_dev_t midi_dev = {
     .dev_addr = 0,
     .dev_hdl = NULL,
     .device_connected = false,
+    .interface_claimed = false,
+    .interface_num = 0,
+    .interface_alt = 0,
     .mutex = NULL
 };
 
@@ -53,57 +73,118 @@ static void handle_rx_data(usb_transfer_t *transfer)
     }
 }
 
-// Start EP2 IN transfer
-static void start_midi_transfer(usb_device_handle_t dev_hdl)
+static esp_err_t find_midi_endpoint(const usb_config_desc_t *config_desc, usb_midi_endpoint_t *endpoint)
+{
+    const uint8_t *desc = (const uint8_t *)config_desc;
+    uint16_t total_len = config_desc->wTotalLength;
+    uint16_t offset = 0;
+    bool in_midi_interface = false;
+    uint8_t current_interface = 0;
+    uint8_t current_alt = 0;
+
+    while (offset + 2 <= total_len) {
+        uint8_t desc_len = desc[offset];
+        uint8_t desc_type = desc[offset + 1];
+        if (desc_len < 2 || offset + desc_len > total_len) {
+            ESP_LOGW(TAG, "Invalid USB descriptor at offset %u", offset);
+            break;
+        }
+
+        if (desc_type == USB_DESC_TYPE_INTERFACE && desc_len >= sizeof(usb_intf_desc_t)) {
+            const usb_intf_desc_t *intf = (const usb_intf_desc_t *)&desc[offset];
+            current_interface = intf->bInterfaceNumber;
+            current_alt = intf->bAlternateSetting;
+            in_midi_interface = intf->bInterfaceClass == USB_CLASS_AUDIO &&
+                                intf->bInterfaceSubClass == USB_SUBCLASS_MIDISTREAMING;
+            if (in_midi_interface) {
+                ESP_LOGI(TAG,
+                         "Found MIDIStreaming interface %u alt %u with %u endpoint(s)",
+                         current_interface,
+                         current_alt,
+                         intf->bNumEndpoints);
+            }
+        } else if (desc_type == USB_DESC_TYPE_ENDPOINT &&
+                   in_midi_interface &&
+                   desc_len >= sizeof(usb_ep_desc_t)) {
+            const usb_ep_desc_t *ep = (const usb_ep_desc_t *)&desc[offset];
+            uint8_t xfer_type = ep->bmAttributes & USB_ENDPOINT_XFER_MASK;
+            bool is_supported_in_ep = (ep->bEndpointAddress & USB_ENDPOINT_DIR_IN) != 0 &&
+                                      (xfer_type == USB_ENDPOINT_XFER_BULK ||
+                                       xfer_type == USB_ENDPOINT_XFER_INTR);
+            if (is_supported_in_ep) {
+                endpoint->interface_num = current_interface;
+                endpoint->interface_alt = current_alt;
+                endpoint->endpoint_addr = ep->bEndpointAddress;
+                endpoint->max_packet_size = ep->wMaxPacketSize;
+                return ESP_OK;
+            }
+        }
+
+        offset += desc_len;
+    }
+
+    return ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t discover_midi_endpoint(usb_device_handle_t dev_hdl, usb_midi_endpoint_t *midi_ep)
 {
     const usb_config_desc_t *config_desc;
-    ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(dev_hdl, &config_desc));
-
-    // Find MIDI interface (Interface 3)
-    int offset = 0;
-    const usb_intf_desc_t *intf_desc = usb_parse_interface_descriptor(config_desc, 3, 0, &offset);
-    if (intf_desc == NULL) {
-        ESP_LOGE(TAG, "MIDI interface not found");
-        return;
+    esp_err_t err = usb_host_get_active_config_descriptor(dev_hdl, &config_desc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get active config descriptor: %s", esp_err_to_name(err));
+        return err;
     }
 
-    ESP_LOGI(TAG, "Found MIDI interface %d (Class: 0x%02x, SubClass: 0x%02x)",
-             intf_desc->bInterfaceNumber,
-             intf_desc->bInterfaceClass,
-             intf_desc->bInterfaceSubClass);
-
-    // Find EP2 IN endpoint
-    offset = 0;
-    const usb_ep_desc_t *ep_desc = usb_parse_endpoint_descriptor_by_address(
-        config_desc, 3, 0, 0x82, &offset);
-
-    if (ep_desc == NULL) {
-        ESP_LOGE(TAG, "Endpoint 0x82 not found");
-        return;
+    err = find_midi_endpoint(config_desc, midi_ep);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MIDIStreaming IN endpoint not found");
+        return err;
     }
 
-    ESP_LOGI(TAG, "Found endpoint 0x82, max packet size: %d", ep_desc->wMaxPacketSize);
+    ESP_LOGI(TAG,
+             "Using MIDI interface %u alt %u endpoint 0x%02x, max packet size: %u",
+             midi_ep->interface_num,
+             midi_ep->interface_alt,
+             midi_ep->endpoint_addr,
+             midi_ep->max_packet_size);
 
+    return ESP_OK;
+}
+
+// Start IN transfer on the discovered USB MIDI endpoint.
+static esp_err_t start_midi_transfer(usb_device_handle_t dev_hdl, const usb_midi_endpoint_t *midi_ep)
+{
     usb_transfer_t *transfer = NULL;
-    ESP_ERROR_CHECK(usb_host_transfer_alloc(ep_desc->wMaxPacketSize, 0, &transfer));
+    esp_err_t err = usb_host_transfer_alloc(midi_ep->max_packet_size, 0, &transfer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Transfer allocation failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     transfer->device_handle = dev_hdl;
-    transfer->bEndpointAddress = 0x82;  // EP2 IN
+    transfer->bEndpointAddress = midi_ep->endpoint_addr;
     transfer->callback = handle_rx_data;
-    transfer->num_bytes = ep_desc->wMaxPacketSize;
+    transfer->num_bytes = midi_ep->max_packet_size;
 
-    esp_err_t err = usb_host_transfer_submit(transfer);
+    err = usb_host_transfer_submit(transfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Transfer submission failed: %s", esp_err_to_name(err));
         usb_host_transfer_free(transfer);
+        return err;
     }
+
+    return ESP_OK;
 }
 
 // Get device information
 static void get_device_info(usb_device_handle_t dev_hdl)
 {
     usb_device_info_t dev_info;
-    ESP_ERROR_CHECK(usb_host_device_info(dev_hdl, &dev_info));
+    esp_err_t err = usb_host_device_info(dev_hdl, &dev_info);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get device info: %s", esp_err_to_name(err));
+        return;
+    }
     
     ESP_LOGI(TAG, "Device information:");
     ESP_LOGI(TAG, "  Speed: %s", (char *[]){"Low", "Full", "High"}[dev_info.speed]);
@@ -114,7 +195,11 @@ static void get_device_info(usb_device_handle_t dev_hdl)
 static void get_device_desc(usb_device_handle_t dev_hdl)
 {
     const usb_device_desc_t *dev_desc;
-    ESP_ERROR_CHECK(usb_host_get_device_descriptor(dev_hdl, &dev_desc));
+    esp_err_t err = usb_host_get_device_descriptor(dev_hdl, &dev_desc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get device descriptor: %s", esp_err_to_name(err));
+        return;
+    }
     
     ESP_LOGI(TAG, "Device descriptor:");
     ESP_LOGI(TAG, "  VID: 0x%04x", dev_desc->idVendor);
@@ -126,36 +211,90 @@ static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *
 {
     usb_midi_dev_t *dev = (usb_midi_dev_t *)arg;
     switch (event_msg->event) {
-        case USB_HOST_CLIENT_EVENT_NEW_DEV:
+        case USB_HOST_CLIENT_EVENT_NEW_DEV: {
             xSemaphoreTake(dev->mutex, portMAX_DELAY);
             dev->dev_addr = event_msg->new_dev.address;
             ESP_LOGI(TAG, "New device found, address: %d", dev->dev_addr);
-            
-            ESP_ERROR_CHECK(usb_host_device_open(dev->client_hdl, dev->dev_addr, &dev->dev_hdl));
+
+            esp_err_t err = usb_host_device_open(dev->client_hdl, dev->dev_addr, &dev->dev_hdl);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to open device: %s", esp_err_to_name(err));
+                dev->dev_addr = 0;
+                xSemaphoreGive(dev->mutex);
+                break;
+            }
             
             // Get device information and descriptor
             get_device_info(dev->dev_hdl);
             get_device_desc(dev->dev_hdl);
             
-            // Claim interface
-            ESP_ERROR_CHECK(usb_host_interface_claim(dev->client_hdl, dev->dev_hdl, 3, 0));
+            usb_midi_endpoint_t midi_ep = {0};
+            err = discover_midi_endpoint(dev->dev_hdl, &midi_ep);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to discover MIDI endpoint: %s", esp_err_to_name(err));
+                usb_host_device_close(dev->client_hdl, dev->dev_hdl);
+                dev->dev_hdl = NULL;
+                dev->dev_addr = 0;
+                xSemaphoreGive(dev->mutex);
+                break;
+            }
+
+            // Claim the discovered MIDIStreaming interface
+            err = usb_host_interface_claim(dev->client_hdl,
+                                           dev->dev_hdl,
+                                           midi_ep.interface_num,
+                                           midi_ep.interface_alt);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to claim MIDI interface: %s", esp_err_to_name(err));
+                usb_host_device_close(dev->client_hdl, dev->dev_hdl);
+                dev->dev_hdl = NULL;
+                dev->dev_addr = 0;
+                xSemaphoreGive(dev->mutex);
+                break;
+            }
+            dev->interface_claimed = true;
+            dev->interface_num = midi_ep.interface_num;
+            dev->interface_alt = midi_ep.interface_alt;
             
-            start_midi_transfer(dev->dev_hdl);
-            dev->device_connected = true;
+            err = start_midi_transfer(dev->dev_hdl, &midi_ep);
+            if (err == ESP_OK) {
+                dev->device_connected = true;
+            } else {
+                ESP_LOGE(TAG, "Failed to start MIDI transfer: %s", esp_err_to_name(err));
+                usb_host_interface_release(dev->client_hdl, dev->dev_hdl, dev->interface_num);
+                dev->interface_claimed = false;
+                usb_host_device_close(dev->client_hdl, dev->dev_hdl);
+                dev->dev_hdl = NULL;
+                dev->dev_addr = 0;
+            }
             xSemaphoreGive(dev->mutex);
             break;
+        }
 
-        case USB_HOST_CLIENT_EVENT_DEV_GONE:
+        case USB_HOST_CLIENT_EVENT_DEV_GONE: {
             xSemaphoreTake(dev->mutex, portMAX_DELAY);
             if (dev->dev_hdl != NULL) {
                 ESP_LOGI(TAG, "Device disconnected");
-                ESP_ERROR_CHECK(usb_host_device_close(dev->client_hdl, dev->dev_hdl));
+                if (dev->interface_claimed) {
+                    esp_err_t err = usb_host_interface_release(dev->client_hdl,
+                                                               dev->dev_hdl,
+                                                               dev->interface_num);
+                    if (err != ESP_OK) {
+                        ESP_LOGW(TAG, "Failed to release MIDI interface: %s", esp_err_to_name(err));
+                    }
+                    dev->interface_claimed = false;
+                }
+                esp_err_t err = usb_host_device_close(dev->client_hdl, dev->dev_hdl);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to close device: %s", esp_err_to_name(err));
+                }
                 dev->dev_hdl = NULL;
                 dev->dev_addr = 0;
                 dev->device_connected = false;
             }
             xSemaphoreGive(dev->mutex);
             break;
+        }
 
         default:
             break;
@@ -228,6 +367,15 @@ static void usb_midi_task(void *arg)
 
     // Cleanup resources
     if (midi_dev.dev_hdl != NULL) {
+        if (midi_dev.interface_claimed) {
+            esp_err_t err = usb_host_interface_release(midi_dev.client_hdl,
+                                                       midi_dev.dev_hdl,
+                                                       midi_dev.interface_num);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to release MIDI interface during cleanup: %s", esp_err_to_name(err));
+            }
+            midi_dev.interface_claimed = false;
+        }
         ESP_ERROR_CHECK(usb_host_device_close(midi_dev.client_hdl, midi_dev.dev_hdl));
     }
     ESP_ERROR_CHECK(usb_host_client_deregister(midi_dev.client_hdl));
@@ -238,6 +386,10 @@ static void usb_midi_task(void *arg)
 
 esp_err_t usb_midi_init(usb_midi_config_t *config)
 {
+    if (config == NULL || config->data_callback == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (usb_midi_running) {
         return ESP_ERR_INVALID_STATE;
     }

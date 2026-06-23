@@ -1,37 +1,66 @@
-# This is a esp idf workflow to build ESP32 based project
+name: Build Firmware Release
 
-name: Build and Artifact the ESP-IDF Project
-
-# Controls when the action will run. 
 on:
-  # Triggers the workflow on tag create like v1.0, v2.0.0 and so on
   push:
     tags:
-     - 'v*'
-
-  # Allows you to run this workflow manually from the Actions tab
+      - "v*"
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: write
+
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
+    name: Build ESP32-S3 firmware
     runs-on: ubuntu-latest
+    container: espressif/idf:release-v5.3
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      - name: Install ESP-IDF and Build project
-        uses: rmshub/esp-idf-action@v6
-        with: 
-            esp_idf_version: v4.4.6
-            esp_idf_target: esp32s3
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Archive build output artifacts
+      - name: Build firmware
+        shell: bash
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py build
+
+      - name: Package release files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp build/usb2ble_midi_bridge.bin release/
+          cp build/bootloader/bootloader.bin release/
+          cp build/partition_table/partition-table.bin release/
+          cp build/flasher_args.json release/
+          cp build/flash_args release/
+          cat > release/README.txt <<'EOF'
+          USB2BLE MIDI Bridge firmware
+
+          Flash with ESP-IDF:
+            idf.py -p PORT flash
+
+          Manual esptool command:
+            python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 usb2ble_midi_bridge.bin
+          EOF
+          cd release
+          sha256sum \
+            bootloader.bin \
+            flash_args \
+            flasher_args.json \
+            partition-table.bin \
+            README.txt \
+            usb2ble_midi_bridge.bin \
+            > SHA256SUMS.txt
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: build
-          path: |
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
-            build/usb2ble_midi_bridge.bin
+          name: usb2ble-midi-bridge-firmware
+          path: release/*
+
+      - name: Attach firmware to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*

@@ -1,4 +1,5 @@
 # ESP-IDF
+.esp-idf/
 build/
 sdkconfig.old
 .DS_Store
