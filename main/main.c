@@ -3,115 +3,80 @@
 #include "nvs_flash.h"
 #include "usb_midi.h"
 #include "ble_midi.h"
+#include "ble_to_usb_midi.h"
 #include "esp_timer.h"
+#include "remote_debug.h"
+#include "usb_to_ble_midi.h"
 
 static const char *TAG = "midi_bridge";
+static ble_to_usb_midi_t ble_decoder;
+static uint32_t output_session;
 
-// Timestamp related definitions
-#define MIDI_TIMESTAMP_PERIOD_US 320   // BLE MIDI timestamp unit (microseconds)
-#define MAX_TIMESTAMP_VALUE 0x1FFF     // Maximum value for 13-bit timestamp
-
-// Timestamp control structure
-typedef struct {
-    int64_t last_time_us;     // Last timestamp point
-    uint16_t last_timestamp;   // Last sent timestamp value
-    bool is_initialized;       // Whether initialized
-} timestamp_control_t;
-
-static timestamp_control_t ts_control = {
-    .last_time_us = 0,
-    .last_timestamp = 0,
-    .is_initialized = false
-};
-
-// Get current timestamp
-static uint16_t get_current_timestamp(void) {
-    int64_t current_time = esp_timer_get_time();
-    uint16_t new_timestamp;
-
-    if (!ts_control.is_initialized) {
-        ts_control.last_time_us = current_time;
-        ts_control.last_timestamp = 0;
-        ts_control.is_initialized = true;
-        return 0;
+static void ble_midi_data_callback(uint8_t *data, size_t len)
+{
+    remote_debug_count(DIAG_BLE_RX_PACKETS, 1);
+    remote_debug_trace("BLE RX", data, len);
+    uint32_t session = usb_midi_output_session();
+    if (session != output_session || session == 0) {
+        memset(&ble_decoder, 0, sizeof(ble_decoder));
+        output_session = session;
     }
-
-    // Calculate time difference (microseconds)
-    int64_t time_diff = current_time - ts_control.last_time_us;
-    
-    // Convert time difference to timestamp increment
-    uint32_t timestamp_diff = time_diff / MIDI_TIMESTAMP_PERIOD_US;
-    
-    // Calculate new timestamp value
-    new_timestamp = (ts_control.last_timestamp + timestamp_diff) & MAX_TIMESTAMP_VALUE;
-    
-    // Update status
-    ts_control.last_timestamp = new_timestamp;
-    ts_control.last_time_us = current_time;
-    
-    return new_timestamp;
+    if (session == 0) {
+        return;
+    }
+    // One USB event per input byte is a conservative bound, including buffered
+    // SysEx bytes. The characteristic currently accepts at most 100 bytes.
+    uint8_t events[4 * (100 + 2)];
+    size_t events_len;
+    if (!ble_to_usb_midi_decode(&ble_decoder, data, len,
+                                events, sizeof(events), &events_len)) {
+        remote_debug_count(DIAG_BLE_PARSE_ERRORS, 1);
+        ESP_LOGW(TAG, "Discarding malformed or oversized BLE MIDI packet");
+        usb_midi_reset_output();
+        return;
+    }
+    if (events_len == 0) {
+        return;
+    }
+    esp_err_t err = usb_midi_send_data(events, events_len, session);
+    if (err == ESP_OK) {
+        remote_debug_count(DIAG_USB_TX_QUEUED, events_len / 4);
+    } else {
+        remote_debug_count(DIAG_USB_QUEUE_ERRORS, 1);
+        memset(&ble_decoder, 0, sizeof(ble_decoder));
+        if (err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "BLE to USB MIDI queue failed: %s", esp_err_to_name(err));
+            usb_midi_reset_output();
+        }
+    }
 }
 
-// Pack timestamp into BLE MIDI message
-static void pack_timestamp(uint16_t timestamp, uint8_t* ble_data) {
-    ble_data[0] = 0x80 | ((timestamp >> 7) & 0x3F);  // High 7 bits
-    ble_data[1] = 0x80 | (timestamp & 0x7F);         // Low 7 bits
-}
-
-static uint8_t usb_midi_cin_payload_len(uint8_t cin) {
-    switch (cin) {
-    case 0x2:
-    case 0x6:
-    case 0xC:
-    case 0xD:
-        return 2;
-    case 0x3:
-    case 0x4:
-    case 0x7:
-    case 0x8:
-    case 0x9:
-    case 0xA:
-    case 0xB:
-    case 0xE:
-        return 3;
-    case 0x5:
-    case 0xF:
-        return 1;
-    default:
-        return 0;
+static void ble_midi_connection_callback(bool connected)
+{
+    memset(&ble_decoder, 0, sizeof(ble_decoder));
+    if (!connected) {
+        usb_midi_reset_output();
     }
 }
 
 static void forward_usb_midi_event(const uint8_t *event)
 {
-    uint8_t cin = event[0] & 0x0F;
-    uint8_t midi_len = usb_midi_cin_payload_len(cin);
-    if (midi_len == 0) {
-        ESP_LOGW(TAG, "Ignoring unsupported USB MIDI CIN: 0x%01x", cin);
-        return;
-    }
-
-    ESP_LOGD(TAG, "USB MIDI cable=0x%01x cin=0x%01x event=%02x %02x %02x",
-             (event[0] >> 4) & 0x0F,
-             cin,
-             event[1],
-             event[2],
-             event[3]);
-
-    // Get current timestamp
-    uint16_t current_ts = get_current_timestamp();
-
-    // Prepare BLE MIDI packet
-    uint8_t ble_data[5];
-    pack_timestamp(current_ts, ble_data);
-    memcpy(&ble_data[2], &event[1], midi_len);
-
-    // Send data
-    esp_err_t send_success = ble_midi_send_data(ble_data, midi_len + 2);
-    if (send_success == ESP_OK) {
-        ESP_LOGD(TAG, "Forwarded to BLE MIDI (timestamp: 0x%04x)", current_ts);
-    } else if (send_success != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Send failed");
+    remote_debug_count(DIAG_USB_RX_EVENTS, 1);
+    remote_debug_trace("USB RX", event, 4);
+    // BLE-MIDI timestamps are absolute milliseconds modulo 8192, not 320 us.
+    uint16_t timestamp = (esp_timer_get_time() / 1000) & 0x1FFF;
+    uint8_t ble_data[7];
+    size_t len = usb_to_ble_midi_encode(event, timestamp, ble_data);
+    if (!len) return;
+    esp_err_t err = ble_midi_send_data(ble_data, len);
+    if (err == ESP_OK) {
+        remote_debug_count(DIAG_BLE_TX_ACCEPTED, 1);
+        remote_debug_trace("BLE TX", ble_data, len);
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        remote_debug_count(DIAG_BLE_TX_NOT_READY, 1);
+    } else {
+        remote_debug_count(DIAG_BLE_TX_ERRORS, 1);
+        ESP_LOGW(TAG, "USB to BLE send failed: %s", esp_err_to_name(err));
     }
 }
 
@@ -134,6 +99,7 @@ static void usb_midi_data_callback(const uint8_t* data, size_t len) {
 
 void app_main(void)
 {
+    remote_debug_capture_logs();
     ESP_LOGI(TAG, "MIDI Bridge Starting");
     
     // Initialize NVS
@@ -144,6 +110,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     
+    ble_midi_set_callback(ble_midi_data_callback);
+    ble_midi_set_connection_callback(ble_midi_connection_callback);
+
     // Initialize BLE MIDI
     ESP_ERROR_CHECK(ble_midi_init());
     ESP_LOGI(TAG, "BLE MIDI Initialization Completed");
@@ -156,5 +125,9 @@ void app_main(void)
     ESP_ERROR_CHECK(usb_midi_init(&usb_config));
     ESP_LOGI(TAG, "USB MIDI Initialization Completed");
 
+    // MIDI keeps working if network provisioning or Wi-Fi is unavailable.
+    ret = remote_debug_init();
+    if (ret != ESP_OK) ESP_LOGW(TAG, "Network debug unavailable: %s", esp_err_to_name(ret));
+    remote_debug_app_ready();
     ESP_LOGI(TAG, "Waiting for device connection...");
 }

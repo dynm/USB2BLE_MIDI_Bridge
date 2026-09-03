@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdatomic.h>
 #include "ble_midi.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
@@ -84,10 +85,10 @@ static struct gatts_profile_inst midi_profile_tab[MIDI_PROFILE_NUM] = {
 // Add buffer related variables
 static uint8_t blemidi_outbuffer[BLEMIDI_NUM_PORTS][GATTS_MIDI_CHAR_VAL_LEN_MAX];
 static uint32_t blemidi_outbuffer_len[BLEMIDI_NUM_PORTS];
-static size_t blemidi_mtu = GATTS_MIDI_CHAR_VAL_LEN_MAX - 3;
-static bool is_connected = false;
-static bool notifications_enabled = false;
-static bool advertising = false;
+static atomic_size_t blemidi_mtu = GATTS_MIDI_CHAR_VAL_LEN_MAX - 3;
+static atomic_bool is_connected = false;
+static atomic_bool notifications_enabled = false;
+static atomic_bool advertising = false;
 static bool adv_data_configured = false;
 static esp_timer_handle_t adv_restart_timer = NULL;
 
@@ -341,24 +342,9 @@ static const esp_gatts_attr_db_t gatt_db[MIDI_IDX_NB] = {
     }},
 };
 
+static atomic_uint notify_submitted, notify_errors, writes_received, disconnects;
 static midi_callback_t midi_callback = NULL;
-
-static void parse_sysex(const uint8_t* data, uint16_t len) {
-    if (len < 8) return;  // Message too short for the fields below
-    
-    // Skip timestamp bytes
-    const uint8_t* sysex = data + 2;
-    
-    if (sysex[0] == 0xF0 && sysex[1] == 0x7E) {  // Universal Non-realtime
-        ESP_LOGI(TAG, "Received universal system information:");
-        ESP_LOGI(TAG, "   Device ID: 0x%02x", sysex[4]);
-        if (sysex[3] == 0x0D) {  // General MIDI
-            if (sysex[4] == 0x70 && sysex[5] == 0x02) {
-                ESP_LOGI(TAG, "   Request to switch to General MIDI 2 mode");
-            }
-        }
-    }
-}
+static ble_midi_connection_callback_t connection_callback = NULL;
 
 #define LED_GPIO    48
 #define LED_NUM     1
@@ -444,6 +430,11 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         midi_profile_tab[MIDI_PROFILE_APP_IDX].conn_id = param->connect.conn_id;
         midi_profile_tab[MIDI_PROFILE_APP_IDX].gatts_if = gatts_if;
         is_connected = true;
+        notifications_enabled = false;
+        blemidi_mtu = 20;
+        if (connection_callback) {
+            connection_callback(true);
+        }
         advertising = false;
         if (adv_restart_timer != NULL) {
             esp_timer_stop(adv_restart_timer);
@@ -453,8 +444,8 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         esp_ble_conn_update_params_t conn_params = {0};
         memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
         conn_params.latency = 0;
-        conn_params.max_int = 0x20;  // 40 ms
-        conn_params.min_int = 0x10;  // 20 ms
+        conn_params.max_int = 0x0C;  // 15 ms
+        conn_params.min_int = 0x06;  // 7.5 ms
         conn_params.timeout = 400;   // 4 s
         esp_ble_gap_update_conn_params(&conn_params);
 
@@ -474,18 +465,12 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         ESP_LOGD(TAG, "ESP_GATTS_WRITE_EVT, handle: %d, write_len: %d, is_prep: %d",
                  param->write.handle, param->write.len, param->write.is_prep);
         
-        if (!param->write.is_prep) {
+        if (!param->write.is_prep && param->write.offset == 0) {
             if (param->write.handle == midi_handle_table[IDX_CHAR_VAL_A]) {
                 ESP_LOGD(TAG, "Received MIDI data write request");
                 ESP_LOG_BUFFER_HEX_LEVEL(TAG, param->write.value, param->write.len, ESP_LOG_DEBUG);
                 
-                // Check if it's a SysEx message
-                if (param->write.len > 3 && 
-                    param->write.value[2] == 0xF0 && 
-                    param->write.value[param->write.len-1] == 0xF7) {
-                    parse_sysex(param->write.value, param->write.len);
-                }
-                
+                atomic_fetch_add(&writes_received, 1);
                 if (midi_callback && param->write.len > 0) {
                     midi_callback(param->write.value, param->write.len);
                 }
@@ -518,10 +503,14 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
         break;
 
     case ESP_GATTS_DISCONNECT_EVT:
+        atomic_fetch_add(&disconnects, 1);
         ESP_LOGI(TAG, "ESP_GATTS_DISCONNECT_EVT, reason: 0x%x", param->disconnect.reason);
         is_connected = false;
         notifications_enabled = false;
         blemidi_outbuffer_len[0] = 0;
+        if (connection_callback) {
+            connection_callback(false);
+        }
         // Turn off LED when disconnected
         set_led_color(16, 0, 0);
         if (adv_restart_timer != NULL) {
@@ -568,6 +557,10 @@ esp_err_t ble_midi_send_message(uint8_t *data, size_t len) {
 void ble_midi_set_callback(midi_callback_t callback) {
     midi_callback = callback;
 } 
+
+void ble_midi_set_connection_callback(ble_midi_connection_callback_t callback) {
+    connection_callback = callback;
+}
 
 esp_err_t ble_midi_init(void)
 {
@@ -698,8 +691,24 @@ esp_err_t ble_midi_send_data(uint8_t* data, uint16_t length) {
         false);
         
     if (ret != ESP_OK) {
+        atomic_fetch_add(&notify_errors, 1);
         ESP_LOGE(TAG, "Failed to send MIDI data: %d", ret);
+    } else {
+        atomic_fetch_add(&notify_submitted, 1);
     }
-    
     return ret;
+}
+
+void ble_midi_get_status(ble_midi_status_t *status)
+{
+    *status = (ble_midi_status_t) {
+        .connected = is_connected,
+        .notifications_enabled = notifications_enabled,
+        .advertising = advertising,
+        .payload_mtu = blemidi_mtu,
+        .notify_submitted = notify_submitted,
+        .notify_errors = notify_errors,
+        .writes_received = writes_received,
+        .disconnects = disconnects,
+    };
 }

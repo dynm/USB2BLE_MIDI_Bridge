@@ -25,6 +25,10 @@ jobs:
           . /opt/esp/idf/export.sh
           idf.py build
 
+      - name: Test MIDI conversion and USB endpoint discovery
+        shell: bash
+        run: sh tests/run.sh
+
       - name: Package release files
         shell: bash
         run: |
@@ -37,10 +41,12 @@ jobs:
             --flash_size 8MB \
             0x0 build/bootloader/bootloader.bin \
             0x8000 build/partition_table/partition-table.bin \
-            0x10000 build/usb2ble_midi_bridge.bin
+            0x10000 build/usb2ble_midi_bridge.bin \
+            0x610000 build/ota_data_initial.bin
           cp build/usb2ble_midi_bridge.bin release/
           cp build/bootloader/bootloader.bin release/
           cp build/partition_table/partition-table.bin release/
+          cp build/ota_data_initial.bin release/
           cp build/flasher_args.json release/
           cp build/flash_args release/
           cat > release/flash_merged.sh <<'EOF'
@@ -91,7 +97,20 @@ jobs:
             sh flash_merged.sh /dev/cu.usbserial-120
 
           Advanced multi-file command:
-            python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 usb2ble_midi_bridge.bin
+            python -m esptool --chip esp32s3 -p PORT -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 8MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 usb2ble_midi_bridge.bin 0x610000 ota_data_initial.bin
+
+          OTA update (after initial serial installation and Wi-Fi provisioning):
+            From the repository directory, run:
+            python tools/midi_remote.py --host DEVICE_IP ota path/to/usb2ble_midi_bridge.bin
+            The tool reads your local .ota-pass file, verifies the upload, and
+            waits for reboot and startup validation. Wait for "OTA complete:"
+            before reconnecting BLE MIDI. Pause playback during the update.
+
+          Use only usb2ble_midi_bridge.bin for OTA. First installation and
+          partition table changes require serial flashing. Wi-Fi and management
+          credentials are provisioned locally and are not included in releases.
+          Setup, English debug page, and OTA instructions:
+            https://github.com/dynm/USB2BLE_MIDI_Bridge#wi-fi-logs-and-ota
           EOF
           cd release
           sha256sum \
@@ -100,6 +119,7 @@ jobs:
             flasher_args.json \
             flash_merged.sh \
             partition-table.bin \
+            ota_data_initial.bin \
             README.txt \
             usb2ble_midi_bridge_merged.bin \
             usb2ble_midi_bridge.bin \

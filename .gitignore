@@ -10,3 +10,11 @@ sdkconfig.old
 # dependencies
 managed_components/
 dependencies.lock
+
+# Local Wi-Fi and OTA credentials, including generated configuration images
+.wifi-pass
+.ota-pass
+netcfg.bin
+*.private.csv
+
+__pycache__/

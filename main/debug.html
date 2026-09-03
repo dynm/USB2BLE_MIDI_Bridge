@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MIDI Bridge Diagnostics</title>
+<style>
+body{font:15px system-ui,sans-serif;background:#111827;color:#e5e7eb;max-width:1100px;margin:30px auto;padding:0 20px}h1{font-size:25px}button,input{font:inherit;padding:9px;border:1px solid #475569;border-radius:5px;background:#1e293b;color:inherit;margin:4px 8px 4px 0}button{cursor:pointer}pre{background:#030712;padding:16px;border-radius:6px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;max-height:480px}#message{color:#7dd3fc}section{margin-top:24px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:700px){.grid{grid-template-columns:1fr}}label{display:block;margin:10px 0}small{color:#94a3b8}
+</style>
+<h1>USB ↔ BLE MIDI Diagnostics</h1>
+<p>Monitor piano USB input, BLE notification subscriptions, and MIDI traffic in both directions.</p>
+<label>Management password <input id="password" type="password" autocomplete="off" placeholder="Password from .ota-pass"></label>
+<label>Or load your local .ota-pass file <input id="config" type="file"></label>
+<button id="connect">Connect</button><button id="traceOn">Enable MIDI Trace</button><button id="traceOff">Disable MIDI Trace</button><button id="reopen">Reconnect USB MIDI</button>
+<p id="message" role="status">Enter your management password. The configuration file is read locally in your browser.</p>
+<div class="grid"><section><h2>Connection Status</h2><pre id="status">Waiting for connection</pre></section><section><h2>Recent Logs</h2><pre id="logs">Waiting for connection</pre></section></div>
+<section><h2>OTA Update</h2><p>Run this command from the project directory to upload application firmware. The tool reads <code>.ota-pass</code>, verifies the upload, and waits for the device to restart and pass its startup check.</p><pre id="ota"></pre><small>Use usb2ble_midi_bridge.bin for OTA. First installation and partition table changes require USB flashing. Pause playback before updating and reconnect BLE MIDI after the restart.</small></section>
+<script>
+let password='',cursor=0,running=false,timer;
+const $=id=>document.getElementById(id);
+$('ota').textContent=`python tools/midi_remote.py --host ${location.host} ota build/usb2ble_midi_bridge.bin`;
+$('config').onchange=async e=>{const file=e.target.files[0];if(!file)return;const text=await file.text();const line=text.trim();$('password').value=line.startsWith('password=')?line.slice(9):line;};
+async function api(path,options={}){const r=await fetch(path,{...options,cache:'no-store',headers:{Authorization:'Bearer '+password,...options.headers}});if(!r.ok){if(r.status===401){running=false;throw Error('Incorrect management password.');}throw Error(await r.text());}return r;}
+async function poll(){if(!running)return;try{const status=await(await api('/api/status')).json();$('status').textContent=JSON.stringify(status,null,2);const result=await(await api('/api/logs?after='+cursor)).json();if(result.next<cursor)$('logs').textContent='Device restarted\n';if(result.dropped)$('logs').textContent+='\n[Older log entries were overwritten]\n';for(const line of result.entries)$('logs').textContent+=line.text.replace(/\x1b\[[0-9;]*m/g,'');cursor=result.next;$('logs').textContent=$('logs').textContent.slice(-24000);$('logs').scrollTop=$('logs').scrollHeight;$('message').textContent='Connected · Refreshing every second';}catch(e){$('message').textContent=e.message;}finally{if(running)timer=setTimeout(poll,1000);}}
+$('connect').onclick=()=>{clearTimeout(timer);password=$('password').value;cursor=0;$('logs').textContent='';running=true;poll();};
+async function control(path,body){try{if(!password)password=$('password').value;const r=await api(path,{method:'POST',body});$('message').textContent=await r.text();}catch(e){$('message').textContent=e.message;}}
+$('traceOn').onclick=()=>control('/api/trace','1');$('traceOff').onclick=()=>control('/api/trace','0');$('reopen').onclick=()=>control('/api/usb/reconnect');
+</script></html>
